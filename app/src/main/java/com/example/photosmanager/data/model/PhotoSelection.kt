@@ -4,5 +4,7 @@ data class PhotoSelection(
     val photoInfo: PhotoInfo,
     var action: PhotoAction = PhotoAction.KEEP,
     /** 由「附近」插入的照片，不允许再对它点「附近」，否则队列会无限膨胀 */
-    val fromNearby: Boolean = false
+    val fromNearby: Boolean = false,
+    /** 当 [action] 为 [PhotoAction.MARK_MOVE] 时记录目标相册 */
+    var moveTarget: MoveTarget? = null
 )

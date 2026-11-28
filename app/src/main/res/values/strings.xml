@@ -1,17 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">PhotosManager</string>
-
-    <!--
-      界面文字一律放这里，不写在 .kt 里：和孪生项目 ScreenshotBye 一样。
-      读屏念出来的内容、通知标题、旋钮描述都走资源，改文案不用动逻辑，
-      也不会出现"这一句在 A 页是硬编码、在 B 页又是另一套说法"。
-    -->
-
-    <!-- 通知渠道与服务通知：渠道名和正文都放这里，系统通知设置里看到的就是这些字。
-         常驻通知只有 background_service_channel 一条；以前那两个前台服务的渠道
-         由 BackgroundService 启动时 deleteNotificationChannel 清掉，别在系统设置里留下两个空渠道。
-         措辞上不用「监听」这类词——不懂技术的人看到会以为应用在盯着屏幕。 -->
     <string name="ch_service">照片整理结果</string>
     <string name="ch_service_desc">删完一批照片之后的结果提醒</string>
     <string name="ch_bg">后台服务</string>
@@ -19,7 +8,6 @@
     <string name="notif_background_body">后台服务运行中</string>
     <string name="notif_milestone_body">已帮您删除超过 %1$d 张图片啦！o(^▽^)o</string>
 
-    <!-- 首页：权限 + 引导 + 设置入口 -->
     <string name="home_subtitle">在每次亮屏的碎片时间里管理相册</string>
     <string name="main_running">运行中 · 每次 %1$d 张</string>
     <string name="main_stopped">未运行</string>
@@ -32,7 +20,6 @@
     <string name="home_autostart_title">自启动</string>
     <string name="home_autostart_body">请允许自启动与后台活动，否则应用被杀掉后，亮屏就不会再提醒</string>
 
-    <!-- 设置页 -->
     <string name="settings_title">设置</string>
     <string name="main_service_switch">启用服务</string>
     <string name="dial_session">每次显示</string>
@@ -49,10 +36,7 @@
     <string name="main_open_guide">使用引导</string>
     <string name="settings_about">关于</string>
 
-    <!-- 无感删除（= Android 11+ 的「所有文件访问」），文案与孪生项目 ScreenshotBye 一字不差 -->
     <string name="settings_all_files">无感删除</string>
-    <!-- 开启后唯一确定的是「不弹系统确认框」。原件去向三方应用查不到（真删与搬进隐藏回收站
-         在媒体库里是同一个表现），所以这里不提回收站，代价全在感叹号那段说明里 -->
     <string name="settings_all_files_on">已开启 · 不弹确认</string>
     <string name="settings_all_files_off">未授予</string>
     <string name="settings_all_files_warn">无感删除的代价说明</string>
@@ -60,32 +44,38 @@
     <string name="settings_all_files_warn_body">开了它，删除当场生效、不再弹系统确认框。某些系统上被删的照片不会进相册回收站，删掉就彻底没了，请谨慎开启。\n\n至于这台机器会不会进回收站，本应用查不出来，所以界面上一律不写。原因：原生安卓是直接从媒体库抹掉；有的系统会认账，把条目标成「已回收」，这种能确认；更多定制系统（比如小米把文件挪进 DCIM/.globalTrash 这类不被媒体库索引的目录）会让条目和原路径一起消失——这跟「真删了」在应用侧长得一模一样，分不出来。\n\n想知道某张还能不能找回，只能去相册的回收站看一眼。用不带无感删除的那条路（系统弹窗确认）删的，才是明确交给系统回收站的。</string>
     <string name="settings_all_files_warn_ok">知道了</string>
 
-    <!-- 配色名称 -->
     <string name="palette_beige">米白</string>
     <string name="palette_slate">青灰</string>
     <string name="palette_terracotta">陶土</string>
     <string name="palette_indigo">靛蓝</string>
     <string name="palette_graphite">石墨</string>
 
-    <!-- 相册选择页 -->
     <string name="album_title">相册设置</string>
     <string name="album_empty">没有读取到相册</string>
     <string name="album_hold_hint">长按一行，等灰色进度条走满可以给这个相册插一面小旗当记号，再长按一次取掉。点一行仍然是勾选或取消勾选。</string>
     <string name="cd_album_flagged">已作记号</string>
     <string name="album_unknown">未知相册</string>
 
-    <!-- 关于页 -->
     <string name="about_title">关于</string>
     <string name="about_version">版本 %1$s (%2$d)</string>
-    <string name="about_body">PhotosManager 做的事情很小：每次你点亮屏幕，它从你选好的相册里挑几张照片出来，你只判断一句「要」或「不要」。判断过的不再重复出现，觉得某张值得再看时，可以把它附近的几张一起拉进这一轮。\n\n删除默认由系统在弹窗里确认（设置页可以开「无感删除」跳过这一步），本应用不保存照片副本，卸载也不会带走你的相册。</string>
+    <string name="about_body">PhotosManager 做的事情很小：每次你点亮屏幕，它从你选好的相册里挑几张照片出来，你可以选择保留、移动到其他相册，或者标记删除。判断过的不再重复出现，觉得某张值得再看时，还可以把它附近的几张一起拉进这一轮。\n\n移动与删除默认都会在确认页汇总并由系统弹窗授权（设置页开启「无感删除」可跳过弹窗），本应用不保存照片副本，卸载也不会带走你的相册。</string>
 
-    <!-- 确认删除页 -->
     <string name="confirm_title">确认删除</string>
+    <string name="confirm_title_move">确认移动</string>
+    <string name="confirm_title_mixed">确认整理</string>
     <string name="confirm_cancel">取消</string>
     <string name="confirm_delete_n">确认删除 %1$d 张</string>
+    <string name="confirm_move_n">确认移动 %1$d 张</string>
+    <string name="confirm_mixed_n">移动 %1$d · 删除 %2$d</string>
+    <string name="confirm_section_move">待移动（%1$d 张）</string>
+    <string name="confirm_section_delete">待删除（%1$d 张）</string>
+    <string name="confirm_move_route">%1$s → %2$s</string>
+    <string name="confirm_toast_moved_only">已移动 %1$d 张照片</string>
+    <string name="confirm_toast_moved_and_deleted">已移动 %1$d 张，已删除 %2$d 张</string>
+    <string name="confirm_toast_moved_partial">已移动 %1$d 张，%2$d 张移动失败</string>
+    <string name="confirm_toast_move_failed">%1$d 张照片移动失败</string>
     <string name="dialog_preview">查看照片</string>
 
-    <!-- 悬浮窗 -->
     <string name="float_no_photo">没有可用的照片</string>
     <string name="float_done_title">这一批照片全部判断完了</string>
     <string name="float_done_body">所选相册里现有的 %1$d 张都已经判断过了</string>
@@ -93,41 +83,49 @@
     <string name="float_go_settings">去设置</string>
     <string name="float_restart_round">重新整理一轮</string>
     <string name="float_album_from">来自于 %1$s</string>
+    <string name="float_status_move_to">将移至：%1$s</string>
+    <string name="float_status_marked_delete">已标记删除</string>
     <string name="float_load_failed">无法加载图片</string>
     <string name="float_keep">保留</string>
+    <string name="float_move">移动</string>
     <string name="float_delete">删除</string>
     <string name="float_nearby">附近</string>
     <string name="float_progress">%1$d / %2$d</string>
 
-    <!-- 首次引导 -->
+    <string name="move_picker_title">移动到相册</string>
+    <string name="move_new_album">新建相册</string>
+    <string name="move_new_album_hint">输入新相册名称</string>
+    <string name="move_new_album_path_note">将保存到 Pictures 目录下</string>
+    <string name="move_new_album_invalid">名称不能为空且不能包含斜杠或特殊符号</string>
+    <string name="move_new_album_confirm">确定</string>
+    <string name="move_picker_empty">没有其他可用相册，可点击右上角「新建相册」</string>
+    <string name="move_recent_tag">最近</string>
+    <string name="move_album_count">%1$d 张</string>
+
     <string name="onb_skip">跳过</string>
     <string name="onb_page_label">%1$d / %2$d</string>
     <string name="onb_next">下一步</string>
     <string name="onb_prev">上一步</string>
     <string name="onb_start">开始使用</string>
-
     <string-array name="onb_titles">
         <item>PhotosManager 做什么</item>
         <item>一次整理长什么样</item>
         <item>为什么要这些权限</item>
-        <item>删除怎么确认</item>
+        <item>移动与删除怎么确认</item>
         <item>最后一步</item>
     </string-array>
-
     <string-array name="onb_bodies">
-        <item>相册里攒着大量只看过的照片，但专门腾出时间去清理总也排不上。这个应用换个办法：每次你点亮屏幕的那十几秒，随机拿出几张照片（默认 5 张，可选 3／5／8／10／15／20），你只判断要不要留下。</item>
-        <item>亮屏后弹出的整理界面里一张一张过：要留着点「保留」，想连旁边几张一起看就点「附近」，不要就点「删除」——没用照片的附近往往也是没用照片。判断过的不会再出现，一轮走完会告诉你这批一共多少张。</item>
+        <item>相册里攒着大量只看过的照片，但专门腾出时间去清理总也排不上。这个应用换个办法：每次你点亮屏幕的那十几秒，随机拿出几张照片（默认 5 张，可选 3／5／8／10／15／20），你只判断保留、归类到其他相册，还是删掉。</item>
+        <item>亮屏后弹出的整理界面里一张一张过：要留着点「保留」，想归类到别的文件夹点「移动」（支持已有相册或新建相册），想连旁边几张一起看就点「附近」，不要就点「删除」。判断过的不会再出现，一轮走完会告诉你这批一共多少张。</item>
         <item>读取相册：不授权看不到照片。通知：不授权应用在后台跑不住。显示在其他应用上层：亮屏时那层整理界面靠它。缺任一项，应用都会在首页把「请求权限」按钮留着，点一下就能补齐。</item>
-        <item>你在整理界面里选「删除」只是把它们标出来，进确认页再看一遍、可以反选，最后交给系统删除——默认还会弹一次系统确认框，设置里的「无感删除」可以跳过这一步。本应用不保存照片副本，也不替你决定什么该留。</item>
+        <item>你在整理界面里选「移动」或「删除」只是先把它们标出来，本轮结束进确认页统一核对、支持反选，最后交给系统执行——默认会弹一次系统授权框，设置里的「无感删除」可以跳过弹窗。本应用不保存照片副本，也不替你决定什么该留。</item>
         <item>进设置页：先选好要管理的相册，再定每次显示几张、加入附近几张，最后打开顶部的「启用服务」。之后每次亮屏都会是新一轮整理。</item>
     </string-array>
 
-    <!-- 旋钮无障碍描述 -->
     <string name="dial_desc_with_label">%1$s，当前 %2$d %3$s</string>
     <string name="dial_value_desc">%1$d %2$s</string>
     <string name="dial_error_two_presets">DetentDial 至少需要两个档位</string>
 
-    <!-- 通用 -->
     <string name="cd_back">返回</string>
     <string name="cd_close">关闭</string>
 </resources>

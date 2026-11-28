@@ -7,146 +7,110 @@ import android.os.Build
 import android.util.Log
 import android.view.Gravity
 import android.view.WindowManager
+import androidx.compose.material3.LocalContentColor
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.platform.ComposeView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.ViewModelStoreOwner
 import androidx.lifecycle.setViewTreeLifecycleOwner
+import androidx.lifecycle.setViewTreeViewModelStoreOwner
 import androidx.savedstate.SavedStateRegistry
 import androidx.savedstate.SavedStateRegistryController
 import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
-import androidx.lifecycle.ViewModelStore
-import androidx.lifecycle.ViewModelStoreOwner
-import androidx.lifecycle.setViewTreeViewModelStoreOwner
-import com.example.photosmanager.util.PermissionHelper
-import androidx.compose.foundation.layout.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.ComposeView
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
+import com.example.photosmanager.data.model.PendingMove
 import com.example.photosmanager.ui.confirm.ConfirmDeleteActivity
+import com.example.photosmanager.util.PermissionHelper
 
 class FloatingWindowManager(private val context: Context) {
     private var windowManager: WindowManager? = null
     private var composeView: ComposeView? = null
     private var lifecycleOwner: LifecycleOwner? = null
+    private var layoutParams: WindowManager.LayoutParams? = null
 
     fun show() {
         try {
-            Log.d("FloatingWindowManager", "开始显示悬浮窗")
-            // 检查悬浮窗权限
             if (!PermissionHelper.hasOverlayPermission(context)) {
                 Log.e("FloatingWindowManager", "没有悬浮窗权限")
                 return
             }
-            Log.d("FloatingWindowManager", "悬浮窗权限检查通过")
-            
-            // 悬浮窗已经在显示就保持原样。
-            // 之前每次亮屏都先 dismiss 再重建，等于把这一轮未完成的队列清零，
-            // 用户熄屏又亮屏就得从头再来；顺带也去掉主线程上的 Thread.sleep(100)。
             if (composeView != null) {
                 Log.d("FloatingWindowManager", "悬浮窗已在显示，保持当前进度")
                 return
             }
-            
+
             windowManager = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
             if (windowManager == null) {
                 Log.e("FloatingWindowManager", "无法获取 WindowManager")
                 return
             }
-            Log.d("FloatingWindowManager", "已获取 WindowManager")
-            
-            // 使用 Application Context 创建 ComposeView
+
             val appContext = if (context is android.app.Service) {
                 context.applicationContext
             } else {
                 context
             }
-            
-            Log.d("FloatingWindowManager", "创建 LifecycleOwner 和 SavedStateRegistryOwner")
-            // 创建 LifecycleOwner 和 SavedStateRegistryOwner 用于 ComposeView
+
             val owner = object : LifecycleOwner, SavedStateRegistryOwner, ViewModelStoreOwner {
                 private val lifecycleRegistry = LifecycleRegistry(this)
                 private val savedStateRegistryController = SavedStateRegistryController.create(this)
                 private val _viewModelStore = ViewModelStore()
-                
+
                 init {
-                    // 在 init 中立即调用 performRestore（这是初始化阶段）
-                    // 使用空的 Bundle，因为悬浮窗不需要恢复状态
                     try {
                         savedStateRegistryController.performRestore(android.os.Bundle())
-                        Log.d("FloatingWindowManager", "performRestore 在 init 中成功")
                     } catch (e: Exception) {
                         Log.e("FloatingWindowManager", "performRestore 在 init 中失败", e)
-                        // 如果失败，继续执行，但 Compose 可能会出错
                     }
-                    // 设置 Lifecycle 状态为 CREATED（performRestore 之后）
                     lifecycleRegistry.currentState = Lifecycle.State.CREATED
                 }
-                
+
                 override val lifecycle: Lifecycle
                     get() = lifecycleRegistry
-                
+
                 override val savedStateRegistry: SavedStateRegistry
                     get() = savedStateRegistryController.savedStateRegistry
-                
+
                 override val viewModelStore: ViewModelStore
                     get() = _viewModelStore
             }
+
             lifecycleOwner = owner
-            
-            Log.d("FloatingWindowManager", "创建 ComposeView")
+
             composeView = ComposeView(appContext).apply {
-                // 设置所有必需的 ViewTree 属性 - 必须在添加到 WindowManager 之前设置
                 setViewTreeLifecycleOwner(owner)
                 setViewTreeSavedStateRegistryOwner(owner)
                 setViewTreeViewModelStoreOwner(owner)
             }
-            
-            // 在设置 LifecycleOwner 后再设置内容
+
             composeView?.setContent {
                 com.example.photosmanager.ui.theme.PHOTOSMANAGERTheme {
-                    // M3 的 MaterialTheme 只往下发 colorScheme / typography / shapes，
-                    // 不管 LocalContentColor —— 那是 Scaffold、Surface 的活儿。悬浮窗是服务里
-                    // 裸挂着的一个 ComposeView，外层既没有 Scaffold 也没有 Surface，
-                    // 所以凡是没显式写颜色的 Icon / Text / 进度条全部退回默认的黑色：
-                    // 系统深色模式下那块底是 #171718，右上角的叉号就成了黑上黑，看不见。
-                    // 这里按当前深浅色把内容色补齐，一整层的默认取色才跟着配色走。
                     CompositionLocalProvider(
                         LocalContentColor provides MaterialTheme.colorScheme.onSurface
                     ) {
                         FloatingWindowContent(
-                            onDismiss = {
-                                Log.d("FloatingWindowManager", "用户关闭悬浮窗")
+                            onDismiss = { dismiss() },
+                            onFocusableChange = { focusable -> setFocusable(focusable) },
+                            onComplete = { photosToDelete, photosToMove ->
                                 dismiss()
-                            },
-                            onComplete = { photosToDelete ->
-                                Log.d("FloatingWindowManager", "照片检查完成，准备删除 ${photosToDelete.size} 张照片")
-                                dismiss()
-                                // 只有当有照片需要删除时才显示确认删除界面
-                                if (photosToDelete.isNotEmpty()) {
-                                    showConfirmDeleteActivity(photosToDelete)
+                                if (photosToDelete.isNotEmpty() || photosToMove.isNotEmpty()) {
+                                    showConfirmDeleteActivity(photosToDelete, photosToMove)
                                 }
                             }
                         )
                     }
                 }
             }
-            
-            // 在添加到 WindowManager 之前，确保 Lifecycle 状态正确
+
             (lifecycleOwner?.lifecycle as? LifecycleRegistry)?.currentState = Lifecycle.State.STARTED
             (lifecycleOwner?.lifecycle as? LifecycleRegistry)?.currentState = Lifecycle.State.RESUMED
 
-            // 获取屏幕尺寸
             val displayMetrics = android.content.res.Resources.getSystem().displayMetrics
-            val screenWidth = displayMetrics.widthPixels
-            val screenHeight = displayMetrics.heightPixels
-            val windowHeight = (screenHeight * 0.75).toInt()
-            
-            Log.d("FloatingWindowManager", "屏幕尺寸: ${screenWidth}x${screenHeight}, 悬浮窗高度: $windowHeight")
+            val windowHeight = (displayMetrics.heightPixels * 0.75).toInt()
 
             val params = WindowManager.LayoutParams().apply {
                 type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -156,10 +120,6 @@ class FloatingWindowManager(private val context: Context) {
                     WindowManager.LayoutParams.TYPE_PHONE
                 }
                 format = PixelFormat.TRANSLUCENT
-                // FLAG_NOT_FOCUSABLE: 不获取焦点，但可以接收触摸事件
-                // FLAG_LAYOUT_IN_SCREEN: 允许窗口延伸到屏幕外
-                // FLAG_HARDWARE_ACCELERATED: 硬件加速
-                // FLAG_NOT_TOUCH_MODAL: 允许触摸事件传递给后面的窗口（当触摸在窗口外时）
                 flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                         WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                         WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED or
@@ -170,30 +130,52 @@ class FloatingWindowManager(private val context: Context) {
                 x = 0
                 y = 0
             }
+            layoutParams = params
 
-            Log.d("FloatingWindowManager", "添加悬浮窗到 WindowManager")
             windowManager?.addView(composeView, params)
-            Log.d("FloatingWindowManager", "悬浮窗已成功显示")
         } catch (e: Exception) {
             Log.e("FloatingWindowManager", "显示悬浮窗失败", e)
-            e.printStackTrace()
+        }
+    }
+
+    fun setFocusable(focusable: Boolean) {
+        val view = composeView ?: return
+        val params = layoutParams ?: return
+        val wm = windowManager ?: return
+        try {
+            val newFlags = if (focusable) {
+                params.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
+            } else {
+                params.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            }
+            val newSoftInputMode = if (focusable) {
+                @Suppress("DEPRECATION")
+                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
+                        WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE
+            } else {
+                WindowManager.LayoutParams.SOFT_INPUT_STATE_UNSPECIFIED
+            }
+            if (params.flags != newFlags || params.softInputMode != newSoftInputMode) {
+                params.flags = newFlags
+                params.softInputMode = newSoftInputMode
+                wm.updateViewLayout(view, params)
+            }
+        } catch (e: Exception) {
+            Log.w("FloatingWindowManager", "更新悬浮窗焦点标志失败", e)
         }
     }
 
     fun dismiss() {
         try {
-            // 先停止 Lifecycle 和清理 ViewModelStore
             lifecycleOwner?.let { owner ->
                 val lifecycle = owner.lifecycle
                 if (lifecycle is LifecycleRegistry) {
                     lifecycle.currentState = Lifecycle.State.DESTROYED
                 }
-                // 清理 ViewModelStore
                 if (owner is ViewModelStoreOwner) {
                     owner.viewModelStore.clear()
                 }
             }
-            
             composeView?.let { view ->
                 windowManager?.removeView(view)
             }
@@ -203,20 +185,21 @@ class FloatingWindowManager(private val context: Context) {
             composeView = null
             windowManager = null
             lifecycleOwner = null
+            layoutParams = null
         }
     }
 
-    private fun showConfirmDeleteActivity(photosToDelete: List<String>) {
+    private fun showConfirmDeleteActivity(
+        photosToDelete: List<String>,
+        photosToMove: List<PendingMove>
+    ) {
         val intent = Intent(context, ConfirmDeleteActivity::class.java).apply {
-            putStringArrayListExtra("photos_to_delete", ArrayList(photosToDelete))
-            // NEW_TASK + MULTIPLE_TASK，配合清单里单独的 taskAffinity：
-            // 确认页必须待在自己的任务栈里。跟 MainActivity 共用默认 affinity 时，
-            // 它会被压进应用已有的那个栈，关掉之后露出底下的主页，
-            // 而不是回到用户亮屏前正在看的 QQ、浏览器之类。
-            // MULTIPLE_TASK 同时保证每轮都是全新的实例，不会复用到上一轮遗留的待删列表。
+            putStringArrayListExtra(ConfirmDeleteActivity.EXTRA_PHOTOS_TO_DELETE, ArrayList(photosToDelete))
+            if (photosToMove.isNotEmpty()) {
+                putExtra(ConfirmDeleteActivity.EXTRA_PHOTOS_TO_MOVE_JSON, PendingMove.toJson(photosToMove))
+            }
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_MULTIPLE_TASK)
         }
         context.startActivity(intent)
     }
 }
-

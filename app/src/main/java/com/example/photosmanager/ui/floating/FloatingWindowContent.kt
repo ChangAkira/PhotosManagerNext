@@ -1,34 +1,41 @@
 package com.example.photosmanager.ui.floating
 
 import android.net.Uri
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import com.example.photosmanager.R
+import com.example.photosmanager.data.model.AlbumInfo
+import com.example.photosmanager.data.model.MoveTarget
+import com.example.photosmanager.data.model.PendingMove
 import com.example.photosmanager.data.model.PhotoAction
-import com.example.photosmanager.data.model.PhotoInfo
 import com.example.photosmanager.data.model.PhotoSelection
 import com.example.photosmanager.data.repository.PhotoRepository
 import com.example.photosmanager.data.repository.PreferencesRepository
@@ -41,15 +48,15 @@ import kotlinx.coroutines.launch
 @Composable
 fun FloatingWindowContent(
     onDismiss: () -> Unit,
-    onComplete: (List<String>) -> Unit
+    onFocusableChange: (Boolean) -> Unit = {},
+    onComplete: (List<String>, List<PendingMove>) -> Unit
 ) {
     val context = LocalContext.current
     val photoRepository = remember { PhotoRepository(context) }
     val preferencesRepository = remember { PreferencesRepository(context) }
     val reviewRepository = remember { ReviewRepository(context) }
     val scope = rememberCoroutineScope()
-    
-    // 获取屏幕宽度的像素值
+
     val density = LocalDensity.current
     val screenWidthDp = LocalConfiguration.current.screenWidthDp
     val screenWidthPx = remember(screenWidthDp) {
@@ -63,12 +70,48 @@ fun FloatingWindowContent(
     var photosPerSession by remember { mutableStateOf(5) }
     var nearbyCount by remember { mutableStateOf(10) }
     var isLoading by remember { mutableStateOf(true) }
-    // 所选相册已经全部判断完。不再自动开新一轮，改成明确的完成页让用户自己决定。
     var allReviewed by remember { mutableStateOf(false) }
-    // 完成页要告诉用户"一共多少张都判断过了"
     var reviewedTotal by remember { mutableStateOf(0) }
-    // 递增一次就重新抽一轮，用于完成页上的「重新整理一轮」
     var reloadTick by remember { mutableStateOf(0) }
+
+    var showMovePicker by remember { mutableStateOf(false) }
+    var availableAlbums by remember { mutableStateOf<List<AlbumInfo>>(emptyList()) }
+    var recentTargets by remember { mutableStateOf<List<String>>(emptyList()) }
+    var flaggedAlbums by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var isAlbumsLoading by remember { mutableStateOf(false) }
+
+    fun finishOrAdvance(position: Int) {
+        val snapshotQueue = SessionStore.queue
+        photos = snapshotQueue
+        if (position < snapshotQueue.size - 1) {
+            val next = position + 1
+            currentIndex = next
+            SessionStore.setIndex(context, next)
+        } else {
+            val toDelete = snapshotQueue
+                .filter { it.action == PhotoAction.MARK_DELETE }
+                .map { it.photoInfo.uri }
+            val toMove = snapshotQueue.mapNotNull { sel ->
+                val target = sel.moveTarget
+                if (sel.action == PhotoAction.MARK_MOVE && target != null) {
+                    PendingMove(
+                        uri = sel.photoInfo.uri,
+                        displayName = sel.photoInfo.displayName,
+                        sourceAlbum = sel.photoInfo.albumName,
+                        target = target
+                    )
+                } else {
+                    null
+                }
+            }
+            SessionStore.finish(context)
+            if (toDelete.isEmpty() && toMove.isEmpty()) {
+                onDismiss()
+            } else {
+                onComplete(toDelete, toMove)
+            }
+        }
+    }
 
     LaunchedEffect(reloadTick) {
         isLoading = true
@@ -77,13 +120,10 @@ fun FloatingWindowContent(
             val albums = preferencesRepository.enabledAlbums.first()
             val sessionCount = preferencesRepository.photosPerSession.first()
             val nearby = preferencesRepository.nearbyPhotosCount.first()
-
             enabledAlbums = albums
             photosPerSession = sessionCount
             nearbyCount = nearby
 
-            // 先尝试续上未完成的一轮。悬浮窗每次亮屏都会重建，
-            // 如果只认 remember，用户中途熄屏就会丢掉进度和待删标记。
             SessionStore.restoreIfNeeded(context)
             if (SessionStore.isActive) {
                 photos = SessionStore.queue
@@ -94,21 +134,16 @@ fun FloatingWindowContent(
 
             if (albums.isNotEmpty()) {
                 val allPhotos = photoRepository.getAllPhotosFromAlbums(albums)
-                // 去重：使用Set确保URI不重复
                 val uniquePhotos = allPhotos.distinctBy { it.uri }
-                // 已经判断过的照片不再重复推送
                 val reviewed = reviewRepository.getReviewedUris()
                 val eligible = uniquePhotos.filterNot { it.uri in reviewed }
                 if (eligible.isEmpty() && uniquePhotos.isNotEmpty()) {
-                    // 整个池子都判断完了。这里不能偷偷 startNewCycle 再开一轮，
-                    // 用户需要知道"已经全部整理完了"，并自己决定是关服务、换相册，还是重新来一轮。
                     photos = emptyList()
                     allReviewed = true
                     reviewedTotal = uniquePhotos.size
                     isLoading = false
                     return@LaunchedEffect
                 }
-                // 如果可用照片数量不足，使用所有照片
                 val photosToUse = if (eligible.size < photosPerSession) {
                     eligible
                 } else {
@@ -116,7 +151,7 @@ fun FloatingWindowContent(
                 }
                 val selections = photosToUse.map { PhotoSelection(it) }
                 SessionStore.startRound(context, selections)
-                photos = selections
+                photos = SessionStore.queue
                 currentIndex = 0
                 isLoading = false
             } else {
@@ -128,11 +163,9 @@ fun FloatingWindowContent(
         }
     }
 
-
     Box(
         modifier = Modifier
             .fillMaxSize()
-            // 悬浮窗是系统深色模式下用户看到的最大一块面，跟着配色走而不是写死米白
             .background(MaterialTheme.colorScheme.background)
     ) {
         if (isLoading) {
@@ -144,7 +177,6 @@ fun FloatingWindowContent(
                 totalPhotos = reviewedTotal,
                 onDismiss = onDismiss,
                 onOpenSettings = {
-                    // 悬浮窗要先收起，否则它会盖在设置页上面
                     context.startActivity(
                         android.content.Intent(context, SettingsActivity::class.java)
                             .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -164,7 +196,6 @@ fun FloatingWindowContent(
                     .fillMaxSize()
                     .padding(16.dp)
             ) {
-                // 顶部栏：关闭按钮
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.End,
@@ -174,7 +205,6 @@ fun FloatingWindowContent(
                         Icon(Icons.Default.Close, contentDescription = stringResource(R.string.cd_close))
                     }
                 }
-                // 居中显示提示信息
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -199,22 +229,30 @@ fun FloatingWindowContent(
                     when (action) {
                         PhotoAction.KEEP, PhotoAction.MARK_DELETE -> {
                             SessionStore.setAction(context, position, action)
-                            // 记下这张已经判断过，后续轮次不再重复推送
                             reviewRepository.markReviewedAsync(photos[position].photoInfo.uri)
-                            if (position < photos.size - 1) {
-                                val next = position + 1
-                                currentIndex = next
-                                SessionStore.setIndex(context, next)
-                            } else {
-                                val toDelete = photos.filter { it.action == PhotoAction.MARK_DELETE }
-                                    .map { it.photoInfo.uri }
-                                // 本轮已经判完，会话收尾，下次亮屏重新抽一轮
-                                SessionStore.finish(context)
-                                // 如果没有照片需要删除，直接关闭悬浮窗
-                                if (toDelete.isEmpty()) {
-                                    onDismiss()
-                                } else {
-                                    onComplete(toDelete)
+                            finishOrAdvance(position)
+                        }
+                        PhotoAction.MARK_MOVE -> {
+                            showMovePicker = true
+                            scope.launch {
+                                isAlbumsLoading = true
+                                try {
+                                    val all = photoRepository.getAllAlbums()
+                                    val recents = preferencesRepository.recentMoveTargets.first()
+                                    val flagged = preferencesRepository.flaggedAlbums.first()
+                                    recentTargets = recents
+                                    flaggedAlbums = flagged
+                                    availableAlbums = PhotoRepository.sortAlbumsForMove(
+                                        albums = all,
+                                        currentBucketId = currentPhoto.photoInfo.bucketId,
+                                        currentAlbumName = currentPhoto.photoInfo.albumName,
+                                        recentRelativePaths = recents
+                                    )
+                                } catch (e: Exception) {
+                                    android.util.Log.e("FloatingWindowContent", "读取目标相册列表失败", e)
+                                    availableAlbums = emptyList()
+                                } finally {
+                                    isAlbumsLoading = false
                                 }
                             }
                         }
@@ -224,16 +262,11 @@ fun FloatingWindowContent(
                                     currentPhoto.photoInfo,
                                     nearbyCount
                                 )
-                                // 去重：确保附近照片不与已有照片重复
                                 val existingUris = photos.map { it.photoInfo.uri }.toSet()
-                                // 过滤掉重复的照片，只保留不在当前队列中的照片。
-                                // 标记 fromNearby：插进来的照片不能再点「附近」，
-                                // 否则队列会被无限撑大。
                                 val uniqueNearby = nearby
                                     .filter { it.uri !in existingUris }
                                     .map { PhotoSelection(it, fromNearby = true) }
                                 if (uniqueNearby.isNotEmpty()) {
-                                    // 插入到当前照片之后，进度位置不变
                                     SessionStore.insertAfterCurrent(context, uniqueNearby)
                                     photos = SessionStore.queue
                                 }
@@ -259,14 +292,270 @@ fun FloatingWindowContent(
                 currentIndex = currentIndex,
                 totalCount = photos.size
             )
+
+            if (showMovePicker) {
+                MoveAlbumPickerOverlay(
+                    albums = availableAlbums,
+                    recentRelativePaths = recentTargets,
+                    flaggedAlbums = flaggedAlbums,
+                    isLoading = isAlbumsLoading,
+                    onFocusableChange = onFocusableChange,
+                    onSelectTarget = { target ->
+                        val position = currentIndex
+                        showMovePicker = false
+                        SessionStore.setMove(context, position, target)
+                        reviewRepository.markReviewedAsync(currentPhoto.photoInfo.uri)
+                        scope.launch {
+                            preferencesRepository.recordRecentMoveTarget(target.relativePath)
+                        }
+                        finishOrAdvance(position)
+                    },
+                    onClose = {
+                        showMovePicker = false
+                    }
+                )
+            }
         }
     }
 }
 
-/**
- * 所选相册全部判断完之后的完成页。
- * 目的：让用户知道"这一批整理完了"，而不是被无声地重新塞一轮老照片。
- */
+@Composable
+private fun MoveAlbumPickerOverlay(
+    albums: List<AlbumInfo>,
+    recentRelativePaths: List<String>,
+    flaggedAlbums: Set<String>,
+    isLoading: Boolean,
+    onFocusableChange: (Boolean) -> Unit,
+    onSelectTarget: (MoveTarget) -> Unit,
+    onClose: () -> Unit
+) {
+    var creatingNew by remember { mutableStateOf(false) }
+    var newAlbumName by remember { mutableStateOf("") }
+    var nameError by remember { mutableStateOf<String?>(null) }
+
+    val invalidNameError = stringResource(R.string.move_new_album_invalid)
+    val recentSet = remember(recentRelativePaths) {
+        recentRelativePaths.map { PhotoRepository.normalizeRelativePath(it).lowercase() }.toSet()
+    }
+    val duplicateNames = remember(albums) {
+        albums.groupingBy { it.name }.eachCount().filterValues { it > 1 }.keys
+    }
+
+    DisposableEffect(creatingNew) {
+        onFocusableChange(creatingNew)
+        onDispose {
+            onFocusableChange(false)
+        }
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = stringResource(R.string.move_picker_title),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(
+                        onClick = {
+                            creatingNew = !creatingNew
+                            nameError = null
+                        }
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Add,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(stringResource(R.string.move_new_album))
+                    }
+                    IconButton(onClick = onClose) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = stringResource(R.string.cd_close)
+                        )
+                    }
+                }
+            }
+
+            if (creatingNew) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(MaterialTheme.colorScheme.surface)
+                        .padding(12.dp)
+                ) {
+                    OutlinedTextField(
+                        value = newAlbumName,
+                        onValueChange = {
+                            newAlbumName = it
+                            nameError = null
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        label = { Text(stringResource(R.string.move_new_album_hint)) },
+                        isError = nameError != null,
+                        supportingText = {
+                            val text = nameError ?: stringResource(R.string.move_new_album_path_note)
+                            Text(text)
+                        }
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        OutlinedButton(
+                            onClick = {
+                                creatingNew = false
+                                newAlbumName = ""
+                                nameError = null
+                            }
+                        ) {
+                            Text(stringResource(R.string.confirm_cancel))
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Button(
+                            onClick = {
+                                val sanitized = PhotoRepository.sanitizeAlbumName(newAlbumName)
+                                if (sanitized == null) {
+                                    nameError = invalidNameError
+                                } else {
+                                    val relPath = PhotoRepository.buildNewAlbumRelativePath(sanitized)
+                                    val existing = albums.firstOrNull {
+                                        PhotoRepository.normalizeRelativePath(it.relativePath)
+                                            .equals(relPath, ignoreCase = true)
+                                    }
+                                    onSelectTarget(
+                                        existing?.toMoveTarget() ?: MoveTarget(
+                                            albumName = sanitized,
+                                            relativePath = relPath
+                                        )
+                                    )
+                                }
+                            }
+                        ) {
+                            Text(stringResource(R.string.move_new_album_confirm))
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            ) {
+                when {
+                    isLoading -> {
+                        CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
+                    }
+                    albums.isEmpty() -> {
+                        Text(
+                            text = stringResource(R.string.move_picker_empty),
+                            modifier = Modifier
+                                .align(Alignment.Center)
+                                .padding(24.dp),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    else -> {
+                        LazyColumn(
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(vertical = 4.dp)
+                        ) {
+                            items(
+                                items = albums,
+                                key = { "${it.bucketId}_${it.relativePath}" }
+                            ) { album ->
+                                val isRecent = PhotoRepository.normalizeRelativePath(album.relativePath)
+                                    .lowercase() in recentSet
+                                val showPath = album.name in duplicateNames
+                                val isFlagged = album.name in flaggedAlbums
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable { onSelectTarget(album.toMoveTarget()) }
+                                        .padding(horizontal = 8.dp, vertical = 12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Text(
+                                                text = album.name,
+                                                style = MaterialTheme.typography.bodyLarge,
+                                                color = MaterialTheme.colorScheme.onSurface,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                                modifier = Modifier.weight(1f, fill = false)
+                                            )
+                                            if (isFlagged) {
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                Icon(
+                                                    painter = painterResource(R.drawable.ic_flag),
+                                                    contentDescription = stringResource(R.string.cd_album_flagged),
+                                                    tint = MaterialTheme.colorScheme.primary,
+                                                    modifier = Modifier.size(16.dp)
+                                                )
+                                            }
+                                            if (isRecent) {
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                Text(
+                                                    text = stringResource(R.string.move_recent_tag),
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = MaterialTheme.colorScheme.primary
+                                                )
+                                            }
+                                        }
+                                        if (showPath) {
+                                            Text(
+                                                text = album.relativePath.trimEnd('/'),
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                    }
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Text(
+                                        text = stringResource(R.string.move_album_count, album.photoCount),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                HorizontalDivider(
+                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 fun SessionCompleteContent(
     totalPhotos: Int,
@@ -297,11 +586,12 @@ fun SessionCompleteContent(
         ) {
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Center
+                modifier = Modifier.padding(horizontal = 24.dp)
             ) {
                 Text(
                     text = stringResource(R.string.float_done_title),
-                    style = MaterialTheme.typography.titleMedium
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
@@ -342,24 +632,46 @@ fun PhotoViewerContent(
     totalCount: Int
 ) {
     val scrollState = rememberScrollState()
-    var dragOffset by remember { mutableStateOf(0f) }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(16.dp)
     ) {
-        // 顶部栏：相册名称和关闭按钮
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                text = stringResource(R.string.float_album_from, albumName),
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurface
-            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = stringResource(R.string.float_album_from, albumName),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                val statusHint = when (photoSelection.action) {
+                    PhotoAction.MARK_MOVE -> photoSelection.moveTarget?.let {
+                        stringResource(R.string.float_status_move_to, it.albumName)
+                    }
+                    PhotoAction.MARK_DELETE -> stringResource(R.string.float_status_marked_delete)
+                    else -> null
+                }
+                if (statusHint != null) {
+                    Text(
+                        text = statusHint,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (photoSelection.action == PhotoAction.MARK_DELETE) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.primary
+                        },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
             IconButton(onClick = onDismiss) {
                 Icon(Icons.Default.Close, contentDescription = stringResource(R.string.cd_close))
             }
@@ -367,7 +679,6 @@ fun PhotoViewerContent(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // 照片显示区域
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -376,57 +687,44 @@ fun PhotoViewerContent(
                 .background(MaterialTheme.colorScheme.surface)
                 .pointerInput(swipeThreshold) {
                     var totalDragX = 0f
-                    var hasTriggeredSwipe = false // 防止重复触发
-                    val threshold = swipeThreshold // 从参数获取阈值
-                    
+                    var hasTriggeredSwipe = false
+                    val threshold = swipeThreshold
+
                     detectDragGestures(
                         onDragEnd = {
-                            // 只在拖拽结束时检查：水平拖拽超过屏幕宽度的60%则切换照片
                             if (kotlin.math.abs(totalDragX) > threshold && !hasTriggeredSwipe) {
                                 if (totalDragX > 0) {
-                                    // 向右滑动，显示上一张
                                     onSwipeRight()
                                 } else {
-                                    // 向左滑动，显示下一张
                                     onSwipeLeft()
                                 }
                             }
-                            // 重置
                             totalDragX = 0f
                             hasTriggeredSwipe = false
                         }
-                    ) { change: PointerInputChange, dragAmount: Offset ->
+                    ) { _: PointerInputChange, dragAmount: Offset ->
                         totalDragX += dragAmount.x
-                        // 不在拖拽过程中触发，只在结束时触发
                     }
                 }
         ) {
-            // 图片容器：Box + verticalScroll 让横向图占满可用宽度、纵向长图仍可滚动。
-            // verticalScroll 会把最大高度放开为无限，容器高度取 max(可视高度, 图片高度)，
-            // 因此比窗口矮的图片会被居中，比窗口高的图片从头开始滚动、顶部不会被裁掉。
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .verticalScroll(scrollState),
                 contentAlignment = Alignment.Center
             ) {
-                // 使用 Coil 加载图片，添加错误处理
                 val imageUri = try {
                     Uri.parse(photoSelection.photoInfo.uri)
                 } catch (e: Exception) {
-                    android.util.Log.e("PhotoViewerContent", "URI解析失败: ${photoSelection.photoInfo.uri}", e)
                     null
                 }
-                
+
                 if (imageUri != null) {
                     AsyncImage(
                         model = imageUri,
                         contentDescription = null,
                         modifier = Modifier.fillMaxWidth(),
-                        contentScale = ContentScale.Fit,
-                        onError = {
-                            android.util.Log.e("PhotoViewerContent", "图片加载失败: $imageUri")
-                        }
+                        contentScale = ContentScale.Fit
                     )
                 } else {
                     Text(
@@ -438,7 +736,6 @@ fun PhotoViewerContent(
                 }
             }
 
-            // 高度条 - 使用简单的指示器
             if (scrollState.maxValue > 0) {
                 val scrollProgress = scrollState.value.toFloat() / scrollState.maxValue.toFloat()
                 Box(
@@ -454,7 +751,7 @@ fun PhotoViewerContent(
                             .fillMaxHeight()
                             .background(
                                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f),
-                                shape = androidx.compose.foundation.shape.RoundedCornerShape(2.dp)
+                                shape = RoundedCornerShape(2.dp)
                             )
                     )
                     Box(
@@ -463,7 +760,7 @@ fun PhotoViewerContent(
                             .fillMaxHeight(scrollProgress.coerceIn(0f, 1f))
                             .background(
                                 color = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f),
-                                shape = androidx.compose.foundation.shape.RoundedCornerShape(2.dp)
+                                shape = RoundedCornerShape(2.dp)
                             )
                             .align(Alignment.TopCenter)
                     )
@@ -473,38 +770,44 @@ fun PhotoViewerContent(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // 操作按钮 - 改为文字按钮，使用主题色
+        val compactPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp)
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceEvenly
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            // 顺序按用户习惯排：保留 → 附近 → 删除
             Button(
                 onClick = { onAction(PhotoAction.KEEP) },
-                modifier = Modifier.weight(1f).padding(horizontal = 4.dp)
+                modifier = Modifier.weight(1f),
+                contentPadding = compactPadding
             ) {
-                Text(stringResource(R.string.float_keep))
+                Text(stringResource(R.string.float_keep), maxLines = 1)
             }
-
+            Button(
+                onClick = { onAction(PhotoAction.MARK_MOVE) },
+                modifier = Modifier.weight(1f),
+                contentPadding = compactPadding
+            ) {
+                Text(stringResource(R.string.float_move), maxLines = 1)
+            }
             Button(
                 onClick = { onAction(PhotoAction.VIEW_NEARBY) },
                 enabled = nearbyEnabled,
-                modifier = Modifier.weight(1f).padding(horizontal = 4.dp)
+                modifier = Modifier.weight(1f),
+                contentPadding = compactPadding
             ) {
-                Text(stringResource(R.string.float_nearby))
+                Text(stringResource(R.string.float_nearby), maxLines = 1)
             }
-
             Button(
                 onClick = { onAction(PhotoAction.MARK_DELETE) },
-                modifier = Modifier.weight(1f).padding(horizontal = 4.dp)
+                modifier = Modifier.weight(1f),
+                contentPadding = compactPadding
             ) {
-                Text(stringResource(R.string.float_delete))
+                Text(stringResource(R.string.float_delete), maxLines = 1)
             }
         }
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // 进度指示
         Text(
             text = stringResource(R.string.float_progress, currentIndex + 1, totalCount),
             modifier = Modifier.fillMaxWidth(),
@@ -513,4 +816,3 @@ fun PhotoViewerContent(
         )
     }
 }
-

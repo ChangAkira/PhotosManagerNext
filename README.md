@@ -4,7 +4,7 @@
   <p>把每次解锁手机的碎片时间，变成清理相册的时间。</p>
   <p>
     <img alt="platform" src="https://img.shields.io/badge/Android-7.0%2B-green"/>
-    <img alt="release" src="https://img.shields.io/badge/release-v1.12-blue"/>
+    <img alt="release" src="https://img.shields.io/badge/release-v1.13-blue"/>
     <img alt="lang" src="https://img.shields.io/badge/Kotlin-2.0.21-orange"/>
     <img alt="offline" src="https://img.shields.io/badge/联网-不需要-informational"/>
   </p>
@@ -23,17 +23,26 @@ PhotosManager 的思路是不给你整块时间：**每次点亮屏幕，它随�
 1. 你在设置里勾选要管理的相册，打开**启用服务**。
 2. 之后每次屏幕点亮，常驻的 `BackgroundService` 里那个 `ACTION_SCREEN_ON` 接收器收到广播，延迟 300ms 后拉起整理界面。开了**免打扰时段**的话，落在这个区间里的亮屏直接跳过，什么都不弹。
 3. 屏幕底部弹出约占 75% 高度的卡片，随机展示 N 张（默认 5 张）照片，显示"当前第几张 / 共几张"和来源相册。
-4. 每张只有三个动作，从左到右排在**保留 · 附近 · 删除**：
+4. 每张提供四个动作，从左到右排在**保留 · 移动 · 附近 · 删除**：
    - **保留** —— 不做任何处理，下一张
+   - **移动** —— 展开目标相册选择器，选择设备上已有相册或新建相册（自动排除当前相册、置顶最近常用目标），标记待移动后进入下一张
    - **附近** —— 把这张照片前后相邻的几张也拉进本轮队列（只能对随机抽中的照片点，拉进来的不再展开，避免一轮无限膨胀）
    - **删除** —— 标记待删，下一张
 5. 左右滑动切换照片（滑动超过屏宽 10% 生效）。
-6. 一轮结束后进入**确认删除**页，缩略图逐张列出，可以反选取消——取消勾选的照片不会被删除，也会退回待整理池子。
+6. 一轮结束后进入**确认整理**页，分区列出待移动（显示 `原相册 → 目标相册`）与待删除照片，可以逐张反选取消——取消勾选或失败的照片不会执行，也会退回待整理池子。
 7. 点确认后才真正删除。Android 11 及以上走系统原生的 `MediaStore.createDeleteRequest()`，你会再看到一次系统级确认框——应用绝不会静默删掉任何一张照片。
 8. 删除完成后确认页自己关掉，系统回到**你刚才正在看的那个界面**，而不是被丢回桌面，也不会露出本应用的主页。这一步靠的是任务栈：确认页跑在自己的栈里（`taskAffinity` 与主应用不同、不出现在最近任务里），关掉时整栈移除，底下才是用户亮屏前那个应用。
 9. 注意区分：**完成页上的「去设置」**是把你带进应用自己的任务栈（会先收起悬浮窗），所以从设置页按返回会落回应用主页——那是你主动选择进应用的；只有确认删除这条路径承诺"用完即还"。
 
 中途熄屏、按关闭键、甚至应用被系统回收都没关系：**本轮队列、看到第几张、哪些已经标记待删都会保留**，下次亮屏从断点继续。一轮走完（最后一张做出判断）之后才会重新抽取。
+
+### 移动照片到其他相册
+
+整理卡片点击**移动**后，会在当前浮层内展开目标相册列表：
+- 自动排除当前照片所在相册，并将最近使用过的目标相册置顶（带「最近」标记）。
+- 存在同名相册（如 `DCIM/Camera` 与 `Pictures/Camera`）时自动附带相对路径区分；在设置里插过小旗的相册也会保留旗标提示。
+- 支持点击右上角**新建相册**，直接在悬浮窗内输入名称创建目标目录（保存在 `Pictures/<相册名>/`）。
+- 本轮结束后在确认页核对并执行：Android 10+ 优先通过 `MediaStore` 原地更新 `RELATIVE_PATH`（不拷贝字节、保留元数据，重名自动递增编号）；Android 11+ 未授予「所有文件访问」时通过 `MediaStore.createWriteRequest()` 整批仅弹一次系统授权框；Android 7–9 使用文件移动并同步媒体库。
 
 ### 不会重复推同一张照片
 
@@ -183,7 +192,7 @@ app/src/main/java/com/example/photosmanager/
 
 ## English summary
 
-PhotosManager turns the seconds you spend unlocking your phone into album cleanup. Once the service is enabled, every screen wake pops up a floating card over the lock screen area showing a handful of random photos from the albums you picked. Swipe through with one tap each: keep, mark for deletion, or pull in neighbouring shots (burst photos usually sit next to other junk). At the end of the round you review the marked list and confirm — on Android 11+ the actual deletion goes through the system `MediaStore.createDeleteRequest()` dialog, so nothing is ever removed silently. Once the confirm screen is done it returns you to whatever app you were looking at, not to the home screen, and when you have been through every photo in the selected albums the card shows an explicit "all done" page instead of quietly starting over.
+PhotosManager turns the seconds you spend unlocking your phone into album cleanup. Once the service is enabled, every screen wake pops up a floating card over the lock screen area showing a handful of random photos from the albums you picked. Swipe through with one tap each: keep, move to another album (existing or newly created), pull in neighbouring shots (burst photos usually sit next to other junk), or mark for deletion. At the end of the round you review both pending moves and deletions and confirm — on Android 11+ moves and deletions go through `MediaStore.createWriteRequest()` and `MediaStore.createDeleteRequest()` dialogs (or execute directly if All Files Access is granted). Once the confirm screen is done it returns you to whatever app you were looking at, not to the home screen, and when you have been through every photo in the selected albums the card shows an explicit "all done" page instead of quietly starting over.
 
 No network access, no accounts, no analytics: photos, settings and deletion history stay on the device. Requires the overlay permission and runs foreground services to catch screen-on broadcasts, which is why there are persistent notifications.
 

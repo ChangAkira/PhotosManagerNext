@@ -29,28 +29,40 @@ class PreferencesRepository(private val context: Context) {
         private val KEY_DND_END = intPreferencesKey("dnd_end_minute")
         private val KEY_FLAGGED_ALBUMS = stringSetPreferencesKey("flagged_albums")
         private val KEY_TOTAL_DELETED = intPreferencesKey("total_deleted_photos")
-        
-        // 默认值
+        private val KEY_RECENT_MOVE_TARGETS = stringPreferencesKey("recent_move_targets")
+
         const val DEFAULT_PHOTOS_PER_SESSION = 5
         const val DEFAULT_NEARBY_PHOTOS_COUNT = 10
-        /** 免打扰默认 22:00-07:00，跨过午夜 */
         const val DEFAULT_DND_START = 22 * 60
         const val DEFAULT_DND_END = 7 * 60
         const val DEFAULT_THEME_PALETTE = "beige"
-
-        /** 删除总数每破一个整百，发一条庆祝通知 */
         const val DELETED_MILESTONE_STEP = 100
+        const val MAX_RECENT_MOVE_TARGETS = 5
+        private const val RECENT_MOVE_DELIMITER = "\n"
 
-        /**
-         * 这批删除有没有跨过一个整百，跨过了要报哪个数。
-         * 一次删超 100 张只会报最高那个百（比如 190 → 305 只报 300），
-         * 连着弹两条一样的喜报没意义。
-         */
         fun deletedMilestone(before: Int, after: Int): Int? {
             if (after <= before) return null
             val reached = after / DELETED_MILESTONE_STEP
             return if (reached > before / DELETED_MILESTONE_STEP && reached > 0)
                 reached * DELETED_MILESTONE_STEP else null
+        }
+
+        fun updateRecentTargets(
+            current: List<String>,
+            targetRelativePath: String,
+            maxCount: Int = MAX_RECENT_MOVE_TARGETS
+        ): List<String> {
+            val trimmed = targetRelativePath.trim()
+            if (trimmed.isEmpty()) return current.take(maxCount)
+            val updated = mutableListOf(trimmed)
+            for (item in current) {
+                val clean = item.trim()
+                if (clean.isNotEmpty() && !clean.equals(trimmed, ignoreCase = true)) {
+                    updated.add(clean)
+                }
+                if (updated.size >= maxCount) break
+            }
+            return updated
         }
     }
 
@@ -74,7 +86,6 @@ class PreferencesRepository(private val context: Context) {
         preferences[KEY_SERVICE_ENABLED] ?: false
     }
 
-    /** 未完成的一轮询问，JSON 序列化后存这里，进程被杀也能恢复 */
     val activeSessionJson: Flow<String?> = context.dataStore.data.map { preferences ->
         preferences[KEY_ACTIVE_SESSION]
     }
@@ -83,12 +94,10 @@ class PreferencesRepository(private val context: Context) {
         preferences[KEY_THEME_PALETTE] ?: DEFAULT_THEME_PALETTE
     }
 
-    /** 免打扰开关。关掉的时候亮屏照常弹悬浮窗 */
     val dndEnabled: Flow<Boolean> = context.dataStore.data.map { preferences ->
         preferences[KEY_DND_ENABLED] ?: false
     }
 
-    /** 免打扰起止时间，都是"当天第几分钟"，0 到 1439。结束小于开始表示跨午夜 */
     val dndStartMinute: Flow<Int> = context.dataStore.data.map { preferences ->
         preferences[KEY_DND_START] ?: DEFAULT_DND_START
     }
@@ -97,14 +106,30 @@ class PreferencesRepository(private val context: Context) {
         preferences[KEY_DND_END] ?: DEFAULT_DND_END
     }
 
-    /** 相册选择页长按插的小旗，只是记号，不参与抽取照片 */
     val flaggedAlbums: Flow<Set<String>> = context.dataStore.data.map { preferences ->
         preferences[KEY_FLAGGED_ALBUMS] ?: emptySet()
     }
 
-    /** 累计帮用户删掉的张数，用于破整百时的那条喜报 */
     val totalDeletedPhotos: Flow<Int> = context.dataStore.data.map { preferences ->
         preferences[KEY_TOTAL_DELETED] ?: 0
+    }
+
+    val recentMoveTargets: Flow<List<String>> = context.dataStore.data.map { preferences ->
+        val raw = preferences[KEY_RECENT_MOVE_TARGETS].orEmpty()
+        if (raw.isBlank()) emptyList()
+        else raw.split(RECENT_MOVE_DELIMITER).map { it.trim() }.filter { it.isNotEmpty() }
+    }
+
+    suspend fun recordRecentMoveTarget(relativePath: String) {
+        if (relativePath.isBlank()) return
+        context.dataStore.edit { preferences ->
+            val current = preferences[KEY_RECENT_MOVE_TARGETS].orEmpty()
+                .split(RECENT_MOVE_DELIMITER)
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+            val updated = updateRecentTargets(current, relativePath)
+            preferences[KEY_RECENT_MOVE_TARGETS] = updated.joinToString(RECENT_MOVE_DELIMITER)
+        }
     }
 
     suspend fun setFlaggedAlbums(albums: Set<String>) {
@@ -113,7 +138,6 @@ class PreferencesRepository(private val context: Context) {
         }
     }
 
-    /** 记一笔删除数，返回累计后的总数（0 或负数不记账） */
     suspend fun addDeletedPhotos(count: Int): Int {
         if (count <= 0) return totalDeletedPhotos.first()
         var after = count
@@ -190,10 +214,7 @@ class PreferencesRepository(private val context: Context) {
         }
     }
 
-    /** 当前时刻是否落在免打扰时段内。结束时间小于开始时间表示这段跨了午夜 */
     fun inDoNotDisturb(startMinute: Int, endMinute: Int, nowMinute: Int): Boolean =
         if (startMinute <= endMinute) nowMinute in startMinute until endMinute
         else nowMinute >= startMinute || nowMinute < endMinute
 }
-
-

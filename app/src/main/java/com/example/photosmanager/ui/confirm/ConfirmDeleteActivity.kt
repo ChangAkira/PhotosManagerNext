@@ -1,8 +1,12 @@
 package com.example.photosmanager.ui.confirm
 
-import android.app.Activity
+import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.provider.MediaStore
+import android.util.Log
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.Image
@@ -25,6 +29,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.rememberAsyncImagePainter
 import com.example.photosmanager.R
+import com.example.photosmanager.data.model.PendingMove
 import com.example.photosmanager.data.repository.PhotoRepository
 import com.example.photosmanager.data.repository.PreferencesRepository
 import com.example.photosmanager.data.repository.ReviewRepository
@@ -32,35 +37,65 @@ import com.example.photosmanager.ui.components.ThumbnailSize
 import com.example.photosmanager.ui.theme.PHOTOSMANAGERTheme
 import com.example.photosmanager.util.NotificationHelper
 import com.example.photosmanager.util.PermissionHelper
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class ConfirmDeleteActivity : ComponentActivity() {
-    private val deleteRequestCode = 1001
+    companion object {
+        const val EXTRA_PHOTOS_TO_DELETE = "photos_to_delete"
+        const val EXTRA_PHOTOS_TO_MOVE_JSON = "photos_to_move_json"
 
-    /** 本轮在悬浮窗里被标记为待删的全部照片 */
-    private val requestedPhotos: ArrayList<String> by lazy {
-        intent.getStringArrayListExtra("photos_to_delete") ?: arrayListOf()
+        private const val TAG = "ConfirmDeleteActivity"
+        private const val REQUEST_DELETE_BATCH = 1001
+        private const val REQUEST_MOVE_WRITE_BATCH = 1002
+        private const val REQUEST_MOVE_SINGLE_Q = 1003
     }
 
-    /** 用户在确认页真正勾选、并且通过系统授权要删除的照片 */
-    private var selectedForDelete: List<String> = emptyList()
+    private val requestedDeletes: ArrayList<String> by lazy {
+        intent.getStringArrayListExtra(EXTRA_PHOTOS_TO_DELETE) ?: arrayListOf()
+    }
 
+    private val requestedMoves: List<PendingMove> by lazy {
+        PendingMove.fromJson(intent.getStringExtra(EXTRA_PHOTOS_TO_MOVE_JSON))
+    }
+
+    private val photoRepository by lazy { PhotoRepository(this) }
     private val reviewRepository by lazy { ReviewRepository(this) }
     private val preferencesRepository by lazy { PreferencesRepository(this) }
+    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private var selectedForDelete: List<String> = emptyList()
+    private var selectedForMove: List<PendingMove> = emptyList()
+    private var nextMoveIndex: Int = 0
+    private var movedSuccessCount: Int = 0
+    private val moveFailedUris = mutableListOf<String>()
+    private var deletedGoneCount: Int = 0
+    private var deleteFailedCount: Int = 0
+    private var isProcessingState = mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
+        if (requestedDeletes.isEmpty() && requestedMoves.isEmpty()) {
+            finishAndRemoveTask()
+            return
+        }
         setContent {
             PHOTOSMANAGERTheme {
-                ConfirmDeleteScreen(
-                    photosToDelete = requestedPhotos,
-                    onConfirm = { selectedPhotos ->
-                        deletePhotos(selectedPhotos)
+                ConfirmActionsScreen(
+                    photosToDelete = requestedDeletes,
+                    photosToMove = requestedMoves,
+                    isProcessing = isProcessingState.value,
+                    onConfirm = { selectedDeletes, selectedMoves ->
+                        if (!isProcessingState.value) {
+                            startExecution(selectedDeletes, selectedMoves)
+                        }
                     },
                     onCancel = {
-                        // 整批作废：这些照片其实没删掉，退回池子，之后还会再推
-                        reviewRepository.releaseAsync(requestedPhotos)
+                        val allUris = requestedDeletes + requestedMoves.map { it.uri }
+                        reviewRepository.releaseAsync(allUris)
                         finishAndRemoveTask()
                     }
                 )
@@ -68,49 +103,119 @@ class ConfirmDeleteActivity : ComponentActivity() {
         }
     }
 
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == deleteRequestCode) {
-            if (resultCode == RESULT_OK) {
-                // 用户授权删除，执行实际删除。
-                // 注意只能删 selectedForDelete：以前这里直接取 Intent 里的完整列表，
-                // 用户在确认页取消勾选的照片照样会被删掉。
-                performActualDelete(selectedForDelete)
-            } else {
-                // 用户拒绝删除，整批都没删成
-                android.util.Log.w("ConfirmDeleteActivity", "用户拒绝删除权限")
-                reviewRepository.releaseAsync(requestedPhotos)
-                finishAndRemoveTask()
-            }
-        }
-    }
+    private fun startExecution(deletes: List<String>, moves: List<PendingMove>) {
+        isProcessingState.value = true
+        selectedForDelete = deletes
+        selectedForMove = moves
+        nextMoveIndex = 0
+        movedSuccessCount = 0
+        moveFailedUris.clear()
+        deletedGoneCount = 0
+        deleteFailedCount = 0
 
-    private fun deletePhotos(photos: List<String>) {
-        selectedForDelete = photos
-        // 没被勾选的照片不在删除请求里，先退回池子
-        val unchecked = requestedPhotos - photos.toSet()
-        reviewRepository.releaseAsync(unchecked)
+        val uncheckedDeletes = requestedDeletes - deletes.toSet()
+        val selectedMoveUris = moves.map { it.uri }.toSet()
+        val uncheckedMoves = requestedMoves.map { it.uri }.filterNot { it in selectedMoveUris }
+        reviewRepository.releaseAsync(uncheckedDeletes + uncheckedMoves)
 
-        if (photos.isEmpty()) {
+        if (moves.isEmpty() && deletes.isEmpty()) {
             finishAndRemoveTask()
             return
         }
 
-        // 开了「无感删除」（Android 11+ 的「所有文件访问」）就当场生效，不再弹系统确认框；
-        // 没开才把这一批整体交给系统弹窗（一批只弹一次）。Android 10 及以下本来就没有确认弹窗。
-        val needsSystemConfirm = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R &&
-            !PermissionHelper.canDeleteWithoutConfirm(this)
+        if (moves.isNotEmpty()) {
+            beginMovePhase()
+        } else {
+            beginDeletePhase()
+        }
+    }
 
+    private fun beginMovePhase() {
+        val needsBatchWriteRequest = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+            !PermissionHelper.canDeleteWithoutConfirm(this)
+        if (needsBatchWriteRequest) {
+            try {
+                val uris = selectedForMove.map { Uri.parse(it.uri) }
+                val writeRequest = MediaStore.createWriteRequest(contentResolver, uris)
+                startIntentSenderForResult(
+                    writeRequest.intentSender,
+                    REQUEST_MOVE_WRITE_BATCH,
+                    null,
+                    0,
+                    0,
+                    0,
+                    null
+                )
+                return
+            } catch (e: Exception) {
+                Log.e(TAG, "创建批量移动授权请求失败，回退直接尝试移动", e)
+            }
+        }
+        processNextMove()
+    }
+
+    private fun processNextMove() {
+        ioScope.launch {
+            while (nextMoveIndex < selectedForMove.size) {
+                val item = selectedForMove[nextMoveIndex]
+                when (val result = photoRepository.movePhoto(item.uri, item.target)) {
+                    is PhotoRepository.MoveResult.Success -> {
+                        movedSuccessCount++
+                        nextMoveIndex++
+                    }
+                    is PhotoRepository.MoveResult.NeedsPermission -> {
+                        withContext(Dispatchers.Main) {
+                            try {
+                                startIntentSenderForResult(
+                                    result.intentSender,
+                                    REQUEST_MOVE_SINGLE_Q,
+                                    null,
+                                    0,
+                                    0,
+                                    0,
+                                    null
+                                )
+                            } catch (e: Exception) {
+                                Log.e(TAG, "发起 Android 10 移动授权失败", e)
+                                moveFailedUris.add(item.uri)
+                                nextMoveIndex++
+                                processNextMove()
+                            }
+                        }
+                        return@launch
+                    }
+                    is PhotoRepository.MoveResult.Failure -> {
+                        Log.w(TAG, "移动失败: ${item.uri} -> ${item.target.relativePath}, reason=${result.reason}")
+                        moveFailedUris.add(item.uri)
+                        nextMoveIndex++
+                    }
+                }
+            }
+
+            if (moveFailedUris.isNotEmpty()) {
+                reviewRepository.release(moveFailedUris)
+            }
+
+            withContext(Dispatchers.Main) {
+                beginDeletePhase()
+            }
+        }
+    }
+
+    private fun beginDeletePhase() {
+        if (selectedForDelete.isEmpty()) {
+            finishWithSummary()
+            return
+        }
+        val needsSystemConfirm = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+            !PermissionHelper.canDeleteWithoutConfirm(this)
         if (needsSystemConfirm) {
             try {
-                val photoUris = photos.map { android.net.Uri.parse(it) }
-                val deleteRequest = android.provider.MediaStore.createDeleteRequest(
-                    contentResolver,
-                    photoUris
-                )
+                val photoUris = selectedForDelete.map { Uri.parse(it) }
+                val deleteRequest = MediaStore.createDeleteRequest(contentResolver, photoUris)
                 startIntentSenderForResult(
                     deleteRequest.intentSender,
-                    deleteRequestCode,
+                    REQUEST_DELETE_BATCH,
                     null,
                     0,
                     0,
@@ -118,74 +223,135 @@ class ConfirmDeleteActivity : ComponentActivity() {
                     null
                 )
             } catch (e: Exception) {
-                android.util.Log.e("ConfirmDeleteActivity", "创建删除请求失败", e)
-                // 如果创建请求失败，尝试直接删除
-                performActualDelete(photos)
+                Log.e(TAG, "创建删除请求失败", e)
+                performActualDelete(selectedForDelete)
             }
         } else {
-            // 无感删除已授予，或 Android 10 及以下：直接删，不弹系统框
-            performActualDelete(photos)
+            performActualDelete(selectedForDelete)
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        when (requestCode) {
+            REQUEST_MOVE_WRITE_BATCH -> {
+                if (resultCode == RESULT_OK) {
+                    processNextMove()
+                } else {
+                    Log.w(TAG, "用户拒绝移动授权")
+                    val refused = selectedForMove.map { it.uri }
+                    moveFailedUris.addAll(refused)
+                    reviewRepository.releaseAsync(refused)
+                    beginDeletePhase()
+                }
+            }
+            REQUEST_MOVE_SINGLE_Q -> {
+                if (resultCode == RESULT_OK) {
+                    processNextMove()
+                } else {
+                    selectedForMove.getOrNull(nextMoveIndex)?.let {
+                        moveFailedUris.add(it.uri)
+                    }
+                    nextMoveIndex++
+                    processNextMove()
+                }
+            }
+            REQUEST_DELETE_BATCH -> {
+                if (resultCode == RESULT_OK) {
+                    performActualDelete(selectedForDelete)
+                } else {
+                    Log.w(TAG, "用户拒绝删除权限")
+                    deleteFailedCount = selectedForDelete.size
+                    reviewRepository.releaseAsync(selectedForDelete)
+                    finishWithSummary()
+                }
+            }
         }
     }
 
     private fun performActualDelete(photos: List<String>) {
-        val photoRepository = PhotoRepository(this)
-        val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO)
-
-        scope.launch {
-            var deletedCount = 0L
+        ioScope.launch {
             val failed = mutableListOf<String>()
             photos.forEach { uri ->
-                if (photoRepository.deletePhoto(uri)) {
-                    deletedCount++
-                } else {
+                if (!photoRepository.deletePhoto(uri)) {
                     failed.add(uri)
                 }
             }
-            android.util.Log.d("ConfirmDeleteActivity", "删除成功 $deletedCount 张，失败 ${failed.size} 张")
-            // 记一笔累计删除数，破整百时报一声喜。数的是「媒体库里已经不在了」的张数，
-            // 不是上面 deletedCount：走系统确认框那一批是系统删的，应用这边补一刀只拿 0 行，
-            // 照 deletedCount 记的话，没开无感删除的用户一条喜报都收不到。
             val goneCount = photoRepository.countGonePhotos(photos)
-            android.util.Log.d("ConfirmDeleteActivity", "这批已不在媒体库 $goneCount 张")
+            deletedGoneCount = goneCount
+            deleteFailedCount = (photos.size - goneCount).coerceAtLeast(0)
             if (goneCount > 0) {
                 val after = preferencesRepository.addDeletedPhotos(goneCount)
                 PreferencesRepository.deletedMilestone(after - goneCount, after)?.let { milestone ->
                     NotificationHelper.showDeletedMilestone(this@ConfirmDeleteActivity, milestone)
                 }
             }
-            // 删除失败的退回池子，否则用户永远等不到它
-            if (failed.isNotEmpty()) {
-                reviewRepository.release(failed)
+            val stillThere = if (goneCount < photos.size) failed else emptyList()
+            if (stillThere.isNotEmpty()) {
+                reviewRepository.release(stillThere)
             }
-
-            // 只关掉确认页自己，并把它那个独立任务栈一并移除（这个栈不出现在最近任务里，
-            // 光 finish() 万一被用户中途 Home 掉就会留下一个找不回来的空栈）。
-            // 以前这里是 finishAffinity() 再主动发一个 CATEGORY_HOME 的 Intent，
-            // 等于删完强行把用户丢回桌面。但用户是从悬浮窗进来的，
-            // 背后还停在他刚才在看的那个应用上，关掉之后系统会自然回到那个界面。
-            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                finishAndRemoveTask()
+            withContext(Dispatchers.Main) {
+                finishWithSummary()
             }
         }
+    }
+
+    private fun finishWithSummary() {
+        val message = when {
+            movedSuccessCount > 0 && deletedGoneCount > 0 ->
+                getString(R.string.confirm_toast_moved_and_deleted, movedSuccessCount, deletedGoneCount)
+            movedSuccessCount > 0 && moveFailedUris.isNotEmpty() ->
+                getString(R.string.confirm_toast_moved_partial, movedSuccessCount, moveFailedUris.size)
+            movedSuccessCount > 0 ->
+                getString(R.string.confirm_toast_moved_only, movedSuccessCount)
+            moveFailedUris.isNotEmpty() && deletedGoneCount == 0 ->
+                getString(R.string.confirm_toast_move_failed, moveFailedUris.size)
+            else -> null
+        }
+        if (message != null) {
+            Toast.makeText(applicationContext, message, Toast.LENGTH_SHORT).show()
+        }
+        finishAndRemoveTask()
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ConfirmDeleteScreen(
+fun ConfirmActionsScreen(
     photosToDelete: List<String>,
-    onConfirm: (List<String>) -> Unit,
+    photosToMove: List<PendingMove>,
+    isProcessing: Boolean,
+    onConfirm: (List<String>, List<PendingMove>) -> Unit,
     onCancel: () -> Unit
 ) {
-    var selectedPhotos by remember { mutableStateOf(photosToDelete.toSet()) }
+    var selectedDeletes by remember { mutableStateOf(photosToDelete.toSet()) }
+    var selectedMoveUris by remember { mutableStateOf(photosToMove.map { it.uri }.toSet()) }
+
+    val hasDeletes = photosToDelete.isNotEmpty()
+    val hasMoves = photosToMove.isNotEmpty()
+    val totalSelected = selectedDeletes.size + selectedMoveUris.size
+
+    val titleText = when {
+        hasMoves && hasDeletes -> stringResource(R.string.confirm_title_mixed)
+        hasMoves -> stringResource(R.string.confirm_title_move)
+        else -> stringResource(R.string.confirm_title)
+    }
+
+    val confirmButtonText = when {
+        selectedMoveUris.isNotEmpty() && selectedDeletes.isNotEmpty() ->
+            stringResource(R.string.confirm_mixed_n, selectedMoveUris.size, selectedDeletes.size)
+        selectedMoveUris.isNotEmpty() ->
+            stringResource(R.string.confirm_move_n, selectedMoveUris.size)
+        else ->
+            stringResource(R.string.confirm_delete_n, selectedDeletes.size)
+    }
 
     Scaffold(
         topBar = {
-            TopAppBar(title = { Text(stringResource(R.string.confirm_title)) })
+            TopAppBar(title = { Text(titleText) })
         },
         bottomBar = {
-            // 左「取消」用描边按钮、右「确认删除 N 张」用实心按钮，和 ScreenshotBye 的反选屏一致
             BottomAppBar {
                 Row(
                     modifier = Modifier
@@ -193,18 +359,36 @@ fun ConfirmDeleteScreen(
                         .padding(horizontal = 16.dp, vertical = 4.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    OutlinedButton(onClick = onCancel, modifier = Modifier.weight(1f)) {
+                    OutlinedButton(
+                        onClick = onCancel,
+                        enabled = !isProcessing,
+                        modifier = Modifier.weight(1f)
+                    ) {
                         Text(stringResource(R.string.confirm_cancel))
                     }
                     Button(
-                        onClick = { onConfirm(selectedPhotos.toList()) },
+                        onClick = {
+                            val chosenDeletes = photosToDelete.filter { it in selectedDeletes }
+                            val chosenMoves = photosToMove.filter { it.uri in selectedMoveUris }
+                            onConfirm(chosenDeletes, chosenMoves)
+                        },
                         modifier = Modifier.weight(1f),
-                        enabled = selectedPhotos.isNotEmpty(),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.error
-                        )
+                        enabled = !isProcessing && totalSelected > 0,
+                        colors = if (selectedDeletes.isNotEmpty()) {
+                            ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                        } else {
+                            ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                        }
                     ) {
-                        Text(stringResource(R.string.confirm_delete_n, selectedPhotos.size))
+                        if (isProcessing) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                                color = MaterialTheme.colorScheme.onPrimary
+                            )
+                        } else {
+                            Text(confirmButtonText, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
                     }
                 }
             }
@@ -215,38 +399,136 @@ fun ConfirmDeleteScreen(
                 .fillMaxSize()
                 .padding(padding)
         ) {
-            items(photosToDelete) { uri ->
-                PhotoDeleteItem(
-                    uri = uri,
-                    isSelected = selectedPhotos.contains(uri),
-                    onToggle = {
-                        selectedPhotos = if (selectedPhotos.contains(uri)) {
-                            selectedPhotos - uri
-                        } else {
-                            selectedPhotos + uri
+            if (hasMoves) {
+                item(key = "section_moves") {
+                    Text(
+                        text = stringResource(R.string.confirm_section_move, selectedMoveUris.size),
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)
+                    )
+                }
+                items(photosToMove, key = { "move_${it.uri}" }) { pendingMove ->
+                    PhotoMoveItem(
+                        pendingMove = pendingMove,
+                        isSelected = pendingMove.uri in selectedMoveUris,
+                        enabled = !isProcessing,
+                        onToggle = {
+                            selectedMoveUris = if (pendingMove.uri in selectedMoveUris) {
+                                selectedMoveUris - pendingMove.uri
+                            } else {
+                                selectedMoveUris + pendingMove.uri
+                            }
                         }
+                    )
+                }
+            }
+
+            if (hasDeletes) {
+                if (hasMoves) {
+                    item(key = "section_divider") {
+                        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
                     }
-                )
+                }
+                if (hasMoves) {
+                    item(key = "section_deletes") {
+                        Text(
+                            text = stringResource(R.string.confirm_section_delete, selectedDeletes.size),
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)
+                        )
+                    }
+                }
+                items(photosToDelete, key = { "delete_$it" }) { uri ->
+                    PhotoDeleteItem(
+                        uri = uri,
+                        isSelected = selectedDeletes.contains(uri),
+                        enabled = !isProcessing,
+                        onToggle = {
+                            selectedDeletes = if (selectedDeletes.contains(uri)) {
+                                selectedDeletes - uri
+                            } else {
+                                selectedDeletes + uri
+                            }
+                        }
+                    )
+                }
             }
         }
     }
 }
 
-/**
- * 一行一张待确认照片：56dp 缩略图 + 文件名 + 勾选框，整行可点。
- * 版式照 ScreenshotBye 的 item_review_confirm.xml——不再给每张照片套一张卡片，
- * 几十张照片连成一列时，卡片之间的缝隙会把"这是一批"的感觉打断。
- */
 @Composable
-fun PhotoDeleteItem(
-    uri: String,
+fun PhotoMoveItem(
+    pendingMove: PendingMove,
     isSelected: Boolean,
+    enabled: Boolean = true,
     onToggle: () -> Unit
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onToggle)
+            .clickable(enabled = enabled, onClick = onToggle)
+            .heightIn(min = ThumbnailSize + 16.dp)
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Image(
+            painter = rememberAsyncImagePainter(Uri.parse(pendingMove.uri)),
+            contentDescription = stringResource(R.string.dialog_preview),
+            modifier = Modifier
+                .size(ThumbnailSize)
+                .clip(RoundedCornerShape(4.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant),
+            contentScale = ContentScale.Crop
+        )
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .padding(horizontal = 12.dp)
+        ) {
+            Text(
+                text = pendingMove.displayName.ifBlank {
+                    Uri.parse(pendingMove.uri).lastPathSegment ?: pendingMove.uri
+                },
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = stringResource(
+                    R.string.confirm_move_route,
+                    pendingMove.sourceAlbum,
+                    pendingMove.target.albumName
+                ),
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.primary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        Checkbox(
+            checked = isSelected,
+            enabled = enabled,
+            onCheckedChange = { onToggle() }
+        )
+    }
+}
+
+@Composable
+fun PhotoDeleteItem(
+    uri: String,
+    isSelected: Boolean,
+    enabled: Boolean = true,
+    onToggle: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(enabled = enabled, onClick = onToggle)
             .heightIn(min = ThumbnailSize + 16.dp)
             .padding(horizontal = 16.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically
@@ -272,6 +554,7 @@ fun PhotoDeleteItem(
         )
         Checkbox(
             checked = isSelected,
+            enabled = enabled,
             onCheckedChange = { onToggle() }
         )
     }
